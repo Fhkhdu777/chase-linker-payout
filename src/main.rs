@@ -17,6 +17,8 @@ use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use tokio::time::{self, MissedTickBehavior};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
+mod frontend;
+
 const ELIGIBLE_TRADERS_QUERY: &str = r#"
     SELECT DISTINCT
         u."id",
@@ -75,9 +77,9 @@ struct TraderRecord {
     payout_balance: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Trader {
+pub(crate) struct Trader {
     id: String,
     email: String,
     numeric_id: i32,
@@ -87,8 +89,8 @@ struct Trader {
     max_amount: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, FromRow)]
-struct UnassignedPayout {
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub(crate) struct UnassignedPayout {
     id: String,
     #[sqlx(rename = "numericId")]
     #[serde(rename = "numericId")]
@@ -102,7 +104,7 @@ struct UnassignedPayout {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AutoDistributionConfig {
+pub(crate) struct AutoDistributionConfig {
     enabled: bool,
     interval_seconds: u64,
 }
@@ -117,7 +119,7 @@ impl Default for AutoDistributionConfig {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ServerEvent {
+pub(crate) struct ServerEvent {
     #[serde(rename = "type")]
     event_type: String,
     message: Option<String>,
@@ -149,7 +151,7 @@ impl ServerEvent {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     pool: PgPool,
     auto_config: Arc<RwLock<AutoDistributionConfig>>,
     auto_config_tx: watch::Sender<AutoDistributionConfig>,
@@ -219,27 +221,39 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn serve_index() -> impl IntoResponse {
-    Html(INDEX_HTML)
+async fn serve_index(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let traders = load_traders_with_limits(&state)
+        .await
+        .map_err(internal_error)?;
+    let payouts = fetch_unassigned_payouts(&state.pool)
+        .await
+        .map_err(internal_error)?;
+    let settings = read_auto_settings(&state).await;
+    let snapshot = frontend::DashboardSnapshot {
+        traders,
+        payouts,
+        settings,
+    };
+    Ok(Html(frontend::render_dashboard_page(snapshot)))
 }
 
 async fn events(
     State(state): State<AppState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
     let rx = state.event_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|result| async move {
-        match result {
-            Ok(event) => match SseEvent::default().json_data(event) {
-                Ok(evt) => Some(Ok(evt)),
-                Err(err) => {
-                    eprintln!("Failed to serialize SSE event: {err}");
-                    None
-                }
-            },
+    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+        Ok(event) => match SseEvent::default().json_data(event) {
+            Ok(evt) => Some(Ok(evt)),
             Err(err) => {
-                eprintln!("SSE subscriber lagged: {err}");
+                eprintln!("Failed to serialize SSE event: {err}");
                 None
             }
+        },
+        Err(err) => {
+            eprintln!("SSE subscriber lagged: {err}");
+            None
         }
     });
 
@@ -247,22 +261,9 @@ async fn events(
 }
 
 async fn get_traders(State(state): State<AppState>) -> ApiResult<Json<Vec<Trader>>> {
-    let records = fetch_traders(&state.pool).await.map_err(internal_error)?;
-    let limits = state.limits.read().await;
-
-    let traders = records
-        .into_iter()
-        .map(|record| Trader {
-            max_amount: limits.get(&record.id).copied(),
-            id: record.id,
-            email: record.email,
-            numeric_id: record.numeric_id,
-            balance_rub: record.balance_rub,
-            frozen_rub: record.frozen_rub,
-            payout_balance: record.payout_balance,
-        })
-        .collect();
-
+    let traders = load_traders_with_limits(&state)
+        .await
+        .map_err(internal_error)?;
     Ok(Json(traders))
 }
 
@@ -292,57 +293,14 @@ async fn assign_payout(
     State(state): State<AppState>,
     Json(request): Json<AssignPayoutRequest>,
 ) -> ApiResult<Json<AssignPayoutResponse>> {
-    if request.trader_id.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Trader ID is required".to_string()));
-    }
-
-    let mut conn = state.pool.acquire().await.map_err(internal_error)?;
-
-    let result = sqlx::query(
-        r#"
-        UPDATE "Payout"
-        SET "traderId" = $1,
-            "acceptanceTime" = 40
-        WHERE "id" = $2
-          AND "direction" = 'OUT'
-          AND "status" = 'CREATED'
-          AND "acceptedAt" IS NULL
-          AND "traderId" IS NULL
-          AND NOT EXISTS (
-              SELECT 1
-              FROM "AggregatorPayout" ap
-              WHERE ap."payoutId" = "Payout"."id"
-          )
-        "#,
-    )
-    .bind(&request.trader_id)
-    .bind(&payout_id)
-    .execute(&mut *conn)
-    .await
-    .map_err(internal_error)?;
-
-    if result.rows_affected() == 0 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Payout is not eligible for assignment".to_string(),
-        ));
-    }
-
-    println!(
-        "[manual] Assigned payout {payout_id} to trader {}",
-        request.trader_id
-    );
-
-    let _ = state.event_tx.send(ServerEvent::payouts_updated("manual"));
-
+    assign_payout_internal(&state, &payout_id, &request.trader_id).await?;
     Ok(Json(AssignPayoutResponse { success: true }))
 }
 
 async fn get_auto_settings(
     State(state): State<AppState>,
 ) -> ApiResult<Json<AutoDistributionConfig>> {
-    let config = state.auto_config.read().await.clone();
-    Ok(Json(config))
+    Ok(Json(read_auto_settings(&state).await))
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,36 +314,9 @@ async fn update_auto_settings(
     State(state): State<AppState>,
     Json(request): Json<UpdateAutoSettingsRequest>,
 ) -> ApiResult<Json<AutoDistributionConfig>> {
-    let interval = request.interval_seconds.max(1);
-
-    let new_config = AutoDistributionConfig {
-        enabled: request.enabled,
-        interval_seconds: interval,
-    };
-
-    {
-        let mut cfg = state.auto_config.write().await;
-        *cfg = new_config.clone();
-    }
-
-    state
-        .auto_config_tx
-        .send(new_config.clone())
-        .map_err(|err| internal_error(err))?;
-
-    println!(
-        "[settings] Auto distribution {} with interval {} seconds",
-        if new_config.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        },
-        new_config.interval_seconds
-    );
-
-    let _ = state.event_tx.send(ServerEvent::settings_updated());
-
-    Ok(Json(new_config))
+    let updated =
+        update_auto_settings_internal(&state, request.enabled, request.interval_seconds).await?;
+    Ok(Json(updated))
 }
 
 #[derive(Debug, Deserialize)]
@@ -406,24 +337,7 @@ async fn update_trader_limit(
     State(state): State<AppState>,
     Json(request): Json<UpdateLimitRequest>,
 ) -> ApiResult<Json<UpdateLimitResponse>> {
-    let sanitized = request.max_amount.filter(|value| *value > 0.0);
-
-    {
-        let mut limits = state.limits.write().await;
-        if let Some(value) = sanitized {
-            limits.insert(trader_id.clone(), value);
-        } else {
-            limits.remove(&trader_id);
-        }
-    }
-
-    println!(
-        "[settings] Updated trader limit: trader={} limit={:?}",
-        trader_id, sanitized
-    );
-
-    let _ = state.event_tx.send(ServerEvent::limits_updated());
-
+    let sanitized = update_trader_limit_internal(&state, &trader_id, request.max_amount).await?;
     Ok(Json(UpdateLimitResponse {
         trader_id,
         max_amount: sanitized,
@@ -618,386 +532,137 @@ where
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
 }
 
-const INDEX_HTML: &str = r#"<!DOCTYPE html>
-<html lang=\"ru\">
-<head>
-    <meta charset=\"UTF-8\" />
-    <title>Chase Linker Dashboard</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 0;
-            padding: 0;
-            background-color: #f5f6fa;
-            color: #222;
-        }
-        header {
-            background-color: #1e90ff;
-            color: #fff;
-            padding: 16px;
-        }
-        main {
-            padding: 20px;
-            max-width: 1100px;
-            margin: 0 auto;
-        }
-        section {
-            background: #fff;
-            border-radius: 8px;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.08);
-            margin-bottom: 20px;
-            padding: 16px;
-        }
-        h2 {
-            margin-top: 0;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 12px;
-        }
-        th, td {
-            border: 1px solid #dcdde1;
-            padding: 8px;
-            text-align: left;
-        }
-        th {
-            background-color: #f1f2f6;
-        }
-        button {
-            background-color: #1e90ff;
-            color: white;
-            border: none;
-            padding: 6px 12px;
-            border-radius: 4px;
-            cursor: pointer;
-        }
-        button:disabled {
-            background-color: #a4b0be;
-            cursor: not-allowed;
-        }
-        .controls {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 12px;
-            align-items: center;
-        }
-        .status {
-            margin-top: 8px;
-            color: #2f3542;
-        }
-        .error {
-            color: #e74c3c;
-        }
-        .success {
-            color: #27ae60;
-        }
-        select, input[type=\"number\"] {
-            padding: 4px 6px;
-            border-radius: 4px;
-            border: 1px solid #ced6e0;
-        }
-        .limit-controls {
-            display: flex;
-            gap: 8px;
-            align-items: center;
-        }
-        .limit-controls input {
-            width: 110px;
-        }
-    </style>
-</head>
-<body>
-    <header>
-        <h1>Распределение выплат</h1>
-    </header>
-    <main>
-        <section>
-            <h2>Настройки автоматического распределения</h2>
-            <div class=\"controls\">
-                <label>
-                    <input type=\"checkbox\" id=\"auto-enabled\" />
-                    Включить распределение
-                </label>
-                <label>
-                    Интервал (сек):
-                    <input type=\"number\" id=\"auto-interval\" min=\"1\" value=\"30\" />
-                </label>
-                <button id=\"save-settings\">Сохранить</button>
-                <span id=\"settings-message\" class=\"status\"></span>
-            </div>
-        </section>
-        <section>
-            <h2>Доступные трейдеры</h2>
-            <table id=\"traders-table\">
-                <thead>
-                    <tr>
-                        <th>numericId</th>
-                        <th>Email</th>
-                        <th>Рублевый баланс</th>
-                        <th>Заморожено RUB</th>
-                        <th>Payout баланс</th>
-                        <th>Макс сумма</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr><td colspan=\"6\">Загрузка...</td></tr>
-                </tbody>
-            </table>
-        </section>
-        <section>
-            <h2>Нераспределенные выплаты</h2>
-            <table id=\"payouts-table\">
-                <thead>
-                    <tr>
-                        <th>numericId</th>
-                        <th>Сумма</th>
-                        <th>Банк</th>
-                        <th>External Reference</th>
-                        <th>Действия</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr><td colspan=\"5\">Загрузка...</td></tr>
-                </tbody>
-            </table>
-        </section>
-    </main>
-    <script>
-        let currentTraders = [];
-        let isLoading = false;
-        let reloadScheduled = false;
+pub(crate) async fn load_traders_with_limits(state: &AppState) -> Result<Vec<Trader>> {
+    let records = fetch_traders(&state.pool).await?;
+    let limits = state.limits.read().await;
 
-        function formatAmount(value) {
-            if (value === null || value === undefined) {
-                return '-';
-            }
-            return Number(value).toFixed(2);
+    let traders = records
+        .into_iter()
+        .map(|record| Trader {
+            max_amount: limits.get(&record.id).copied(),
+            id: record.id,
+            email: record.email,
+            numeric_id: record.numeric_id,
+            balance_rub: record.balance_rub,
+            frozen_rub: record.frozen_rub,
+            payout_balance: record.payout_balance,
+        })
+        .collect();
+
+    Ok(traders)
+}
+
+pub(crate) async fn read_auto_settings(state: &AppState) -> AutoDistributionConfig {
+    state.auto_config.read().await.clone()
+}
+
+pub(crate) async fn assign_payout_internal(
+    state: &AppState,
+    payout_id: &str,
+    trader_id: &str,
+) -> ApiResult<()> {
+    if trader_id.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Trader ID is required".to_string()));
+    }
+
+    let mut conn = state.pool.acquire().await.map_err(internal_error)?;
+
+    let result = sqlx::query(
+        r#"
+        UPDATE "Payout"
+        SET "traderId" = $1,
+            "acceptanceTime" = 40
+        WHERE "id" = $2
+          AND "direction" = 'OUT'
+          AND "status" = 'CREATED'
+          AND "acceptedAt" IS NULL
+          AND "traderId" IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM "AggregatorPayout" ap
+              WHERE ap."payoutId" = "Payout"."id"
+          )
+        "#,
+    )
+    .bind(trader_id)
+    .bind(payout_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(internal_error)?;
+
+    if result.rows_affected() == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Payout is not eligible for assignment".to_string(),
+        ));
+    }
+
+    println!("[manual] Assigned payout {payout_id} to trader {trader_id}");
+
+    let _ = state.event_tx.send(ServerEvent::payouts_updated("manual"));
+
+    Ok(())
+}
+
+pub(crate) async fn update_auto_settings_internal(
+    state: &AppState,
+    enabled: bool,
+    interval_seconds: u64,
+) -> ApiResult<AutoDistributionConfig> {
+    let interval = interval_seconds.max(1);
+
+    let new_config = AutoDistributionConfig {
+        enabled,
+        interval_seconds: interval,
+    };
+
+    {
+        let mut cfg = state.auto_config.write().await;
+        *cfg = new_config.clone();
+    }
+
+    state
+        .auto_config_tx
+        .send(new_config.clone())
+        .map_err(|err| internal_error(err))?;
+
+    println!(
+        "[settings] Auto distribution {} with interval {} seconds",
+        if new_config.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        new_config.interval_seconds
+    );
+
+    let _ = state.event_tx.send(ServerEvent::settings_updated());
+
+    Ok(new_config)
+}
+
+pub(crate) async fn update_trader_limit_internal(
+    state: &AppState,
+    trader_id: &str,
+    max_amount: Option<f64>,
+) -> ApiResult<Option<f64>> {
+    let sanitized = max_amount.filter(|value| *value > 0.0);
+
+    {
+        let mut limits = state.limits.write().await;
+        if let Some(value) = sanitized {
+            limits.insert(trader_id.to_string(), value);
+        } else {
+            limits.remove(trader_id);
         }
+    }
 
-        async function fetchJson(url, options) {
-            const response = await fetch(url, options);
-            if (!response.ok) {
-                const text = await response.text();
-                throw new Error(text || response.statusText);
-            }
-            if (response.status === 204) {
-                return null;
-            }
-            return response.json();
-        }
+    println!(
+        "[settings] Updated trader limit: trader={} limit={:?}",
+        trader_id, sanitized
+    );
 
-        function renderTraders(traders) {
-            const tbody = document.querySelector('#traders-table tbody');
-            if (!traders.length) {
-                tbody.innerHTML = '<tr><td colspan="6">Нет подходящих трейдеров</td></tr>';
-                return;
-            }
+    let _ = state.event_tx.send(ServerEvent::limits_updated());
 
-            tbody.innerHTML = traders.map(trader => `
-                <tr>
-                    <td>${trader.numericId}</td>
-                    <td>${trader.email}</td>
-                    <td>${formatAmount(trader.balanceRub)}</td>
-                    <td>${formatAmount(trader.frozenRub)}</td>
-                    <td>${formatAmount(trader.payoutBalance)}</td>
-                    <td>
-                        <div class="limit-controls">
-                            <input type="number" min="0" step="0.01" value="${trader.maxAmount ?? ''}" id="limit-input-${trader.id}" placeholder="Без лимита" />
-                            <button class="save-limit" data-trader-id="${trader.id}">Сохранить</button>
-                        </div>
-                    </td>
-                </tr>
-            `).join('');
-
-            tbody.querySelectorAll('.save-limit').forEach(button => {
-                button.addEventListener('click', async (event) => {
-                    const traderId = event.currentTarget.getAttribute('data-trader-id');
-                    await saveTraderLimit(traderId);
-                });
-            });
-        }
-
-        function renderPayouts(payouts) {
-            const tbody = document.querySelector('#payouts-table tbody');
-            if (!payouts.length) {
-                tbody.innerHTML = '<tr><td colspan="5">Нет нераспределенных выплат</td></tr>';
-                return;
-            }
-
-            const traderOptions = currentTraders.map(trader => `
-                <option value="${trader.id}">
-                    ${trader.email} (ID: ${trader.numericId})
-                </option>
-            `).join('');
-
-            tbody.innerHTML = payouts.map(payout => `
-                <tr>
-                    <td>${payout.numericId}</td>
-                    <td>${formatAmount(payout.amount)}</td>
-                    <td>${payout.bank ?? '-'}</td>
-                    <td>${payout.externalReference ?? '-'}</td>
-                    <td>
-                        <div style="display:flex; gap:8px; align-items:center;">
-                            <select id="assign-select-${payout.id}">
-                                <option value="">Выберите трейдера</option>
-                                ${traderOptions}
-                            </select>
-                            <button class="assign-button" data-payout-id="${payout.id}">Привязать</button>
-                        </div>
-                    </td>
-                </tr>
-            `).join('');
-
-            tbody.querySelectorAll('.assign-button').forEach(button => {
-                button.addEventListener('click', async (event) => {
-                    const payoutId = event.currentTarget.getAttribute('data-payout-id');
-                    await assignPayout(payoutId);
-                });
-            });
-        }
-
-        function renderSettings(settings) {
-            document.getElementById('auto-enabled').checked = settings.enabled;
-            document.getElementById('auto-interval').value = settings.intervalSeconds;
-        }
-
-        async function loadData() {
-            if (isLoading) {
-                return;
-            }
-            isLoading = true;
-            try {
-                const [traders, payouts, settings] = await Promise.all([
-                    fetchJson('/api/traders'),
-                    fetchJson('/api/payouts'),
-                    fetchJson('/api/settings/auto-distribution')
-                ]);
-                currentTraders = traders;
-                renderTraders(traders);
-                renderPayouts(payouts);
-                renderSettings(settings);
-            } catch (error) {
-                console.error('Ошибка при загрузке данных:', error);
-                alert('Не удалось загрузить данные: ' + error.message);
-            } finally {
-                isLoading = false;
-            }
-        }
-
-        async function assignPayout(payoutId) {
-            const select = document.getElementById(`assign-select-${payoutId}`);
-            const traderId = select.value;
-
-            if (!traderId) {
-                alert('Выберите трейдера для привязки.');
-                return;
-            }
-
-            try {
-                await fetchJson(`/api/payouts/${payoutId}/assign`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ traderId })
-                });
-                console.log(`Привязан payout ${payoutId} к трейдеру ${traderId}`);
-                await loadData();
-            } catch (error) {
-                console.error('Ошибка привязки выплаты:', error);
-                alert('Не удалось привязать выплату: ' + error.message);
-            }
-        }
-
-        async function saveTraderLimit(traderId) {
-            const input = document.getElementById(`limit-input-${traderId}`);
-            const raw = input.value.trim();
-            const maxAmount = raw === '' ? null : Number(raw);
-
-            if (maxAmount !== null && (Number.isNaN(maxAmount) || maxAmount < 0)) {
-                alert('Укажите неотрицательное число или оставьте поле пустым.');
-                return;
-            }
-
-            try {
-                await fetchJson(`/api/traders/${traderId}/limit`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ maxAmount })
-                });
-                console.log(`Обновлен лимит для трейдера ${traderId}: ${maxAmount}`);
-                await loadData();
-            } catch (error) {
-                console.error('Ошибка сохранения лимита:', error);
-                alert('Не удалось сохранить лимит: ' + error.message);
-            }
-        }
-
-        async function saveSettings() {
-            const enabled = document.getElementById('auto-enabled').checked;
-            const intervalSeconds = Number(document.getElementById('auto-interval').value) || 1;
-            const messageEl = document.getElementById('settings-message');
-
-            try {
-                const result = await fetchJson('/api/settings/auto-distribution', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ enabled, intervalSeconds })
-                });
-                messageEl.textContent = `Сохранено. Интервал ${result.intervalSeconds} сек.`;
-                messageEl.className = 'status success';
-                console.log('Настройки автораспределения обновлены', result);
-            } catch (error) {
-                messageEl.textContent = 'Ошибка сохранения настроек: ' + error.message;
-                messageEl.className = 'status error';
-                console.error('Ошибка сохранения настроек:', error);
-            }
-        }
-
-        function scheduleReload() {
-            if (reloadScheduled) {
-                return;
-            }
-            reloadScheduled = true;
-            setTimeout(async () => {
-                await loadData();
-                reloadScheduled = false;
-            }, 300);
-        }
-
-        function initEventSource() {
-            const eventSource = new EventSource('/api/events');
-            eventSource.onmessage = (event) => {
-                try {
-                    const payload = JSON.parse(event.data);
-                    console.log('Получено событие', payload);
-                    switch (payload.type) {
-                        case 'payouts-updated':
-                        case 'traders-updated':
-                        case 'settings-updated':
-                        case 'limits-updated':
-                            scheduleReload();
-                            break;
-                        default:
-                            break;
-                    }
-                } catch (error) {
-                    console.error('Ошибка обработки события SSE:', error);
-                }
-            };
-            eventSource.onerror = () => {
-                console.warn('SSE соединение потеряно, переподключение...');
-                eventSource.close();
-                setTimeout(initEventSource, 5000);
-            };
-        }
-
-        document.getElementById('save-settings').addEventListener('click', saveSettings);
-
-        document.addEventListener('DOMContentLoaded', async () => {
-            initEventSource();
-            await loadData();
-        });
-    </script>
-</body>
-</html>
-"#;
+    Ok(sanitized)
+}
