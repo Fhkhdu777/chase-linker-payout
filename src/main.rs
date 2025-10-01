@@ -209,7 +209,7 @@ async fn main() -> Result<()> {
         .route("/api/traders/:id/limit", post(update_trader_limit))
         .with_state(state);
 
-    let addr: SocketAddr = ([0, 0, 0, 0], 3000).into();
+    let addr: SocketAddr = ([0, 0, 0, 0], 5555).into();
     println!("Server running on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr)
