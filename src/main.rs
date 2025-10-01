@@ -37,8 +37,6 @@ const ELIGIBLE_TRADERS_QUERY: &str = r#"
       AND (p."traderId" IS NULL OR p."traderId" = u."id")
       AND tm."isMerchantEnabled" = TRUE
       AND tm."isFeeOutEnabled" = TRUE
-      AND tm."feeOut" IS NOT NULL
-      AND tm."feeOut" > 0
       AND COALESCE(u."balanceRub", 0) > 0
       AND u."trafficEnabled" = TRUE
       AND u."banned" = FALSE
