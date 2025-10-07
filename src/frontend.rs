@@ -1,4 +1,5 @@
-use crate::{AutoDistributionConfig, Trader, UnassignedPayout};
+use crate::{AutoDistributionConfig, PayoutListResponse, Trader, UnassignedPayout};
+use chrono::NaiveDateTime;
 use leptos::*;
 use serde::Serialize;
 
@@ -6,6 +7,7 @@ use serde::Serialize;
 pub(crate) struct DashboardSnapshot {
     pub traders: Vec<Trader>,
     pub payouts: Vec<UnassignedPayout>,
+    pub deals: PayoutListResponse,
     pub settings: AutoDistributionConfig,
 }
 
@@ -209,6 +211,80 @@ button:disabled {
     cursor: not-allowed;
     box-shadow: none;
 }
+.mono {
+    font-family: 'Fira Code', 'Source Code Pro', monospace;
+    font-size: 13px;
+    letter-spacing: 0.03em;
+}
+.filters-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+}
+.input-control {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.input-control label {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+}
+.input-control input,
+.input-control select {
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border-light);
+    background: rgba(15, 23, 42, 0.6);
+    color: var(--text-primary);
+}
+.deal-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    align-items: flex-start;
+}
+.deal-reason {
+    font-size: 12px;
+    color: var(--text-muted);
+    max-width: 220px;
+    word-break: break-word;
+}
+.deals-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+}
+.deals-pagination {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    justify-content: flex-end;
+    margin-top: 12px;
+}
+.deals-pagination button {
+    background: rgba(56, 189, 248, 0.18);
+    border: 1px solid rgba(56, 189, 248, 0.25);
+    color: var(--text-primary);
+    padding: 6px 12px;
+    border-radius: 8px;
+}
+.deals-pagination button:disabled {
+    opacity: 0.4;
+}
+button.danger {
+    background: linear-gradient(135deg, var(--error), #dc2626);
+    color: #fff;
+}
+#deals-sort-status.active {
+    background: rgba(56, 189, 248, 0.2);
+    border: 1px solid rgba(56, 189, 248, 0.35);
+    color: var(--accent);
+}
 input[type='number'],
 select {
     background: rgba(15, 23, 42, 0.65);
@@ -315,11 +391,42 @@ const DASHBOARD_SCRIPT: &str = r#"
     };
     const autoBadge = document.getElementById('auto-status-badge');
     const settingsDescription = document.getElementById('settings-description');
+    const dealsControls = {
+        search: document.getElementById('deals-search'),
+        wallet: document.getElementById('deals-wallet'),
+        amount: document.getElementById('deals-amount'),
+        status: document.getElementById('deals-status'),
+        perPage: document.getElementById('deals-per-page'),
+        sortStatus: document.getElementById('deals-sort-status'),
+        reset: document.getElementById('deals-reset'),
+        prev: document.getElementById('deals-prev'),
+        next: document.getElementById('deals-next'),
+        pageInfo: document.getElementById('deals-page-info'),
+    };
 
     let currentTraders = [];
     let currentPayouts = [];
+    let currentDeals = [];
+    let dealsPagination = {
+        page: 1,
+        totalPages: 0,
+        total: 0,
+        perPage: 25,
+    };
+    let dealsFilters = {
+        search: '',
+        wallet: '',
+        amount: '',
+        status: '',
+        sort: 'createdAt',
+        order: 'desc',
+        page: 1,
+        perPage: 25,
+    };
     let isLoading = false;
+    let isDealsLoading = false;
     let reloadScheduled = false;
+    let dealsFilterTimer = null;
 
     function setStatus(type, message) {
         if (!statusBar) {
@@ -355,6 +462,17 @@ const DASHBOARD_SCRIPT: &str = r#"
             minimumFractionDigits: 2,
             maximumFractionDigits: 2,
         });
+    }
+
+    function formatDateTime(value) {
+        if (!value) {
+            return '-';
+        }
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) {
+            return value;
+        }
+        return date.toLocaleString('ru-RU');
     }
 
     function updateMetrics(traders, payouts) {
@@ -479,6 +597,318 @@ const DASHBOARD_SCRIPT: &str = r#"
         });
     }
 
+    function renderDeals(response) {
+        const tbody = document.querySelector('#deals-table tbody');
+        if (!tbody) {
+            return;
+        }
+
+        const items = Array.isArray(response?.items) ? response.items : [];
+        currentDeals = items;
+
+        if (response?.pagination) {
+            const pagination = response.pagination;
+            dealsPagination = {
+                page: Number(pagination.page ?? dealsFilters.page ?? 1),
+                totalPages: Number(pagination.totalPages ?? 0),
+                total: Number(pagination.total ?? 0),
+                perPage: Number(pagination.perPage ?? dealsFilters.perPage ?? 25),
+            };
+            dealsFilters.page = dealsPagination.page;
+            dealsFilters.perPage = dealsPagination.perPage;
+        } else {
+            dealsPagination.totalPages = items.length ? 1 : 0;
+            dealsPagination.total = items.length;
+        }
+
+        if (!items.length) {
+            renderEmpty(tbody, 9, 'Нет выплат по заданным фильтрам');
+            updateDealsPagination();
+            syncDealsFiltersToControls();
+            return;
+        }
+
+        tbody.innerHTML = items.map(deal => {
+            const amount = formatAmount(deal.amount);
+            const external = deal.externalReference ?? '-';
+            const cancelReason = deal.cancelReason ?? '-';
+            const createdAt = formatDateTime(deal.createdAt);
+            const disableCancel = ['CANCELLED', 'COMPLETED', 'SUCCESS', 'FAILED'].includes(deal.status ?? '');
+            const cancelTitle = disableCancel
+                ? 'Отмена недоступна для этого статуса'
+                : 'Отменить выплату';
+            return `
+                <tr>
+                    <td>${deal.numericId}</td>
+                    <td><span class="mono">${deal.id}</span></td>
+                    <td>${external}</td>
+                    <td>${deal.wallet}</td>
+                    <td>${deal.bank}</td>
+                    <td>${amount}</td>
+                    <td>${deal.status}</td>
+                    <td>${createdAt}</td>
+                    <td>
+                        <div class="deal-actions">
+                            <span class="deal-reason">${cancelReason}</span>
+                            <button
+                                class="danger cancel-deal"
+                                data-deal-id="${deal.id}"
+                                title="${cancelTitle}"
+                                ${disableCancel ? 'disabled' : ''}
+                            >Отменить</button>
+                        </div>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+
+        tbody.querySelectorAll('.cancel-deal').forEach(button => {
+            button.addEventListener('click', async (event) => {
+                const dealId = event.currentTarget.getAttribute('data-deal-id');
+                await cancelDeal(dealId);
+            });
+        });
+
+        updateDealsPagination();
+        syncDealsFiltersToControls();
+    }
+
+    function updateDealsPagination() {
+        const pageInfo = dealsControls.pageInfo;
+        if (pageInfo) {
+            if (dealsPagination.totalPages > 0) {
+                pageInfo.textContent = `${dealsPagination.page} / ${dealsPagination.totalPages} (всего ${dealsPagination.total})`;
+            } else {
+                pageInfo.textContent = '0 / 0 (всего 0)';
+            }
+        }
+
+        if (dealsControls.prev) {
+            dealsControls.prev.disabled = dealsPagination.page <= 1;
+        }
+        if (dealsControls.next) {
+            const noMorePages =
+                dealsPagination.totalPages === 0 || dealsPagination.page >= dealsPagination.totalPages;
+            dealsControls.next.disabled = noMorePages;
+        }
+    }
+
+    function syncDealsFiltersToControls() {
+        if (dealsControls.search) {
+            dealsControls.search.value = dealsFilters.search ?? '';
+        }
+        if (dealsControls.wallet) {
+            dealsControls.wallet.value = dealsFilters.wallet ?? '';
+        }
+        if (dealsControls.amount) {
+            dealsControls.amount.value = dealsFilters.amount ?? '';
+        }
+        if (dealsControls.status) {
+            dealsControls.status.value = dealsFilters.status ?? '';
+        }
+        if (dealsControls.perPage) {
+            dealsControls.perPage.value = String(dealsFilters.perPage ?? 25);
+        }
+        syncDealsSortIndicator();
+    }
+
+    function syncDealsSortIndicator() {
+        if (!dealsControls.sortStatus) {
+            return;
+        }
+        if (dealsFilters.sort === 'status') {
+            dealsControls.sortStatus.classList.add('active');
+            dealsControls.sortStatus.setAttribute('data-order', dealsFilters.order);
+            dealsControls.sortStatus.textContent =
+                dealsFilters.order === 'asc' ? 'Статус ↑' : 'Статус ↓';
+        } else {
+            dealsControls.sortStatus.classList.remove('active');
+            dealsControls.sortStatus.removeAttribute('data-order');
+            dealsControls.sortStatus.textContent = 'Сортировка по статусу';
+        }
+    }
+
+    function scheduleDealsReload() {
+        if (dealsFilterTimer) {
+            clearTimeout(dealsFilterTimer);
+        }
+        dealsFilterTimer = setTimeout(() => {
+            dealsFilters.page = 1;
+            loadDeals(true);
+        }, 350);
+    }
+
+    async function loadDeals(showStatus = false) {
+        if (isDealsLoading) {
+            return;
+        }
+        isDealsLoading = true;
+        try {
+            if (showStatus) {
+                setStatus('info', 'Обновляем список выплат...');
+            }
+            const params = new URLSearchParams();
+            if (dealsFilters.search) {
+                params.set('search', dealsFilters.search);
+            }
+            if (dealsFilters.wallet) {
+                params.set('wallet', dealsFilters.wallet);
+            }
+            if (dealsFilters.amount) {
+                const num = Number(dealsFilters.amount);
+                if (!Number.isNaN(num)) {
+                    params.set('amount', String(num));
+                }
+            }
+            if (dealsFilters.status) {
+                params.set('status', dealsFilters.status);
+            }
+            params.set('page', String(dealsFilters.page ?? 1));
+            params.set('perPage', String(dealsFilters.perPage ?? 25));
+            params.set('sort', dealsFilters.sort ?? 'createdAt');
+            params.set('order', dealsFilters.order ?? 'desc');
+
+            const query = params.toString();
+            const response = await fetchJson(`/api/deals${query ? `?${query}` : ''}`);
+            renderDeals(response);
+            if (showStatus) {
+                setStatus('success', 'Список выплат обновлен.');
+            }
+        } catch (error) {
+            console.error('Ошибка загрузки выплат:', error);
+            const tbody = document.querySelector('#deals-table tbody');
+            renderEmpty(tbody, 9, 'Не удалось загрузить выплаты');
+            if (showStatus) {
+                setStatus('error', 'Не удалось загрузить выплаты: ' + error.message);
+            }
+        } finally {
+            isDealsLoading = false;
+        }
+    }
+
+    async function cancelDeal(dealId) {
+        if (!dealId) {
+            return;
+        }
+        const deal = currentDeals.find(item => item.id === dealId);
+        if (deal && ['CANCELLED', 'COMPLETED', 'SUCCESS', 'FAILED'].includes(deal.status ?? '')) {
+            setStatus('warning', 'Эту выплату нельзя отменить.');
+            return;
+        }
+        const confirmed = window.confirm('Вы уверены, что хотите отменить выплату?');
+        if (!confirmed) {
+            return;
+        }
+        let reason = window.prompt('Причина отмены (необязательно):', '');
+        if (reason === null) {
+            reason = '';
+        }
+        const payload = {};
+        if (reason.trim()) {
+            payload.reason = reason.trim();
+        }
+        try {
+            const result = await fetchJson(`/api/payouts/${dealId}/cancel`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            if (result?.callbackDispatched) {
+                setStatus('success', 'Выплата отменена.');
+            } else if (result?.callbackError) {
+                setStatus('warning', 'Выплата отменена, но колбэк не доставлен: ' + result.callbackError);
+            } else {
+                setStatus('success', 'Выплата отменена.');
+            }
+            await loadDeals(false);
+            await loadData(false);
+        } catch (error) {
+            console.error('Ошибка отмены выплаты:', error);
+            setStatus('error', 'Не удалось отменить выплату: ' + error.message);
+        }
+    }
+
+    function initDealsControls() {
+        if (dealsControls.search) {
+            dealsControls.search.addEventListener('input', (event) => {
+                dealsFilters.search = event.target.value.trim();
+                scheduleDealsReload();
+            });
+        }
+        if (dealsControls.wallet) {
+            dealsControls.wallet.addEventListener('input', (event) => {
+                dealsFilters.wallet = event.target.value.trim();
+                scheduleDealsReload();
+            });
+        }
+        if (dealsControls.amount) {
+            dealsControls.amount.addEventListener('input', (event) => {
+                dealsFilters.amount = event.target.value.trim();
+                scheduleDealsReload();
+            });
+        }
+        if (dealsControls.status) {
+            dealsControls.status.addEventListener('change', (event) => {
+                dealsFilters.status = event.target.value.trim();
+                dealsFilters.page = 1;
+                loadDeals(true);
+            });
+        }
+        if (dealsControls.perPage) {
+            dealsControls.perPage.addEventListener('change', (event) => {
+                const value = Number(event.target.value);
+                dealsFilters.perPage = Number.isNaN(value) ? 25 : value;
+                dealsFilters.page = 1;
+                loadDeals(true);
+            });
+        }
+        if (dealsControls.sortStatus) {
+            dealsControls.sortStatus.addEventListener('click', () => {
+                if (dealsFilters.sort === 'status') {
+                    dealsFilters.order = dealsFilters.order === 'asc' ? 'desc' : 'asc';
+                } else {
+                    dealsFilters.sort = 'status';
+                    dealsFilters.order = 'asc';
+                }
+                dealsFilters.page = 1;
+                syncDealsSortIndicator();
+                loadDeals(true);
+            });
+        }
+        if (dealsControls.reset) {
+            dealsControls.reset.addEventListener('click', () => {
+                dealsFilters = {
+                    search: '',
+                    wallet: '',
+                    amount: '',
+                    status: '',
+                    sort: 'createdAt',
+                    order: 'desc',
+                    page: 1,
+                    perPage: 25,
+                };
+                syncDealsFiltersToControls();
+                loadDeals(true);
+            });
+        }
+        if (dealsControls.prev) {
+            dealsControls.prev.addEventListener('click', () => {
+                if (dealsFilters.page > 1) {
+                    dealsFilters.page -= 1;
+                    loadDeals(true);
+                }
+            });
+        }
+        if (dealsControls.next) {
+            dealsControls.next.addEventListener('click', () => {
+                if (dealsPagination.totalPages && dealsFilters.page < dealsPagination.totalPages) {
+                    dealsFilters.page += 1;
+                    loadDeals(true);
+                }
+            });
+        }
+    }
+
     function renderSettings(settings) {
         const checkbox = document.getElementById('auto-enabled');
         const intervalInput = document.getElementById('auto-interval');
@@ -552,7 +982,7 @@ const DASHBOARD_SCRIPT: &str = r#"
                 body: JSON.stringify({ traderId }),
             });
             setStatus('success', 'Выплата успешно распределена.');
-            await loadData(false);
+            await Promise.all([loadData(false), loadDeals(false)]);
         } catch (error) {
             console.error('Ошибка привязки выплаты:', error);
             setStatus('error', 'Не удалось привязать выплату: ' + error.message);
@@ -582,7 +1012,7 @@ const DASHBOARD_SCRIPT: &str = r#"
                 body: JSON.stringify({ maxAmount }),
             });
             setStatus('success', 'Лимит трейдера обновлен.');
-            await loadData(false);
+            await Promise.all([loadData(false), loadDeals(false)]);
         } catch (error) {
             console.error('Ошибка сохранения лимита:', error);
             setStatus('error', 'Не удалось сохранить лимит: ' + error.message);
@@ -604,7 +1034,7 @@ const DASHBOARD_SCRIPT: &str = r#"
             renderSettings(result);
             setStatus('success', 'Настройки сохранены.');
             markUpdated();
-            await loadData(false);
+            await Promise.all([loadData(false), loadDeals(false)]);
         } catch (error) {
             console.error('Ошибка сохранения настроек:', error);
             setStatus('error', 'Не удалось сохранить настройки: ' + error.message);
@@ -617,8 +1047,11 @@ const DASHBOARD_SCRIPT: &str = r#"
         }
         reloadScheduled = true;
         setTimeout(async () => {
-            await loadData(false);
-            reloadScheduled = false;
+            try {
+                await Promise.all([loadData(false), loadDeals(false)]);
+            } finally {
+                reloadScheduled = false;
+            }
         }, 400);
     }
 
@@ -654,10 +1087,21 @@ const DASHBOARD_SCRIPT: &str = r#"
         try {
             currentTraders = Array.isArray(initialData.traders) ? initialData.traders : [];
             currentPayouts = Array.isArray(initialData.payouts) ? initialData.payouts : [];
+            if (initialData.deals?.pagination) {
+                dealsFilters.perPage = Number(initialData.deals.pagination.perPage ?? dealsFilters.perPage);
+                dealsFilters.page = Number(initialData.deals.pagination.page ?? dealsFilters.page);
+            }
             renderTraders(currentTraders);
             renderPayouts(currentPayouts);
+            if (initialData.deals) {
+                renderDeals(initialData.deals);
+            } else {
+                const dealsBody = document.querySelector('#deals-table tbody');
+                renderEmpty(dealsBody, 9, 'Нет данных о выплатах');
+            }
             renderSettings(initialData.settings);
             updateMetrics(currentTraders, currentPayouts);
+            syncDealsFiltersToControls();
             markUpdated();
             setStatus('info', 'Показаны данные на момент загрузки.');
         } catch (error) {
@@ -670,8 +1114,12 @@ const DASHBOARD_SCRIPT: &str = r#"
         if (saveButton) {
             saveButton.addEventListener('click', saveSettings);
         }
+        initDealsControls();
+        if (!initialData) {
+            syncDealsFiltersToControls();
+        }
         initEventSource();
-        await loadData(!initialData);
+        await Promise.all([loadData(!initialData), loadDeals(!initialData)]);
     }
 
     function start() {
@@ -697,10 +1145,23 @@ fn App(snapshot: DashboardSnapshot) -> impl IntoView {
     let settings = snapshot.settings.clone();
 
     let metrics_traders = traders.len();
+    let deals = snapshot.deals.clone();
     let total_payout: f64 = payouts.iter().map(|p| p.amount.unwrap_or_default()).sum();
     let metrics_payouts = payouts.len();
     let total_payout_display = format_amount(Some(total_payout));
     let traders_for_options = traders.clone();
+    let deals_items = deals.items.clone();
+    let deals_pagination = deals.pagination.clone();
+    let deals_page_info = if deals_pagination.total_pages == 0 {
+        "0 / 0 (всего 0)".to_string()
+    } else {
+        format!(
+            "{} / {} (всего {})",
+            deals_pagination.page,
+            deals_pagination.total_pages,
+            deals_pagination.total
+        )
+    };
     let settings_description = if settings.enabled {
         format!(
             "Автораспределение выполняется каждые {} секунд.",
@@ -782,6 +1243,58 @@ fn App(snapshot: DashboardSnapshot) -> impl IntoView {
                                         {options.into_view()}
                                     </select>
                                     <button class="assign-button" data-payout-id={payout.id.clone()}>"Привязать"</button>
+                                </div>
+                            </td>
+                        </tr>
+                    }
+                }
+            />
+        }
+        .into_view()
+    };
+
+    let deals_view = if deals_items.is_empty() {
+        view! { <tr><td class="empty" colspan="9">Нет данных о выплатах</td></tr> }
+            .into_view()
+    } else {
+        view! {
+            <For
+                each=move || deals_items.clone()
+                key=|deal| deal.id.clone()
+                children=move |deal| {
+                    let external_reference = deal
+                        .external_reference
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string());
+                    let cancel_reason = deal
+                        .cancel_reason
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string());
+                    let disable_cancel = matches!(
+                        deal.status.as_str(),
+                        "CANCELLED" | "COMPLETED" | "SUCCESS" | "FAILED"
+                    );
+                    let created_at = format_timestamp(&deal.created_at);
+                    let amount_display = format_amount(Some(deal.amount));
+                    view! {
+                        <tr>
+                            <td>{deal.numeric_id}</td>
+                            <td><span class="mono">{deal.id.clone()}</span></td>
+                            <td>{external_reference}</td>
+                            <td>{deal.wallet.clone()}</td>
+                            <td>{deal.bank.clone()}</td>
+                            <td>{amount_display}</td>
+                            <td>{deal.status.clone()}</td>
+                            <td>{created_at}</td>
+                            <td>
+                                <div class="deal-actions">
+                                    <span class="deal-reason">{cancel_reason}</span>
+                                    <button
+                                        class="danger cancel-deal"
+                                        data-deal-id={deal.id.clone()}
+                                        disabled=disable_cancel
+                                        type="button"
+                                    >"Отменить"</button>
                                 </div>
                             </td>
                         </tr>
@@ -906,6 +1419,101 @@ fn App(snapshot: DashboardSnapshot) -> impl IntoView {
                             </table>
                         </div>
                     </section>
+
+                    <section class="panel">
+                        <div class="panel-header">
+                            <h2>Все выплаты</h2>
+                        </div>
+                        <div class="filters-grid">
+                            <div class="input-control">
+                                <label for="deals-search">Поиск</label>
+                                <input
+                                    id="deals-search"
+                                    type="text"
+                                    placeholder="numericId / externalRef / id"
+                                    value=""
+                                />
+                            </div>
+                            <div class="input-control">
+                                <label for="deals-wallet">Кошелек</label>
+                                <input
+                                    id="deals-wallet"
+                                    type="text"
+                                    placeholder="Номер кошелька"
+                                    value=""
+                                />
+                            </div>
+                            <div class="input-control">
+                                <label for="deals-amount">Сумма</label>
+                                <input
+                                    id="deals-amount"
+                                    type="number"
+                                    step="0.01"
+                                    min="0"
+                                    placeholder="Сумма"
+                                    value=""
+                                />
+                            </div>
+                            <div class="input-control">
+                                <label for="deals-status">Статус</label>
+                                <select id="deals-status">
+                                    <option value="">Все</option>
+                                    <option value="CREATED">CREATED</option>
+                                    <option value="ACTIVE">ACTIVE</option>
+                                    <option value="AVAILABLE">AVAILABLE</option>
+                                    <option value="CHECKING">CHECKING</option>
+                                    <option value="PROCESSING">PROCESSING</option>
+                                    <option value="CANCELLED">CANCELLED</option>
+                                    <option value="COMPLETED">COMPLETED</option>
+                                    <option value="SUCCESS">SUCCESS</option>
+                                    <option value="FAILED">FAILED</option>
+                                    <option value="DISPUTED">DISPUTED</option>
+                                    <option value="EXPIRED">EXPIRED</option>
+                                    <option value="DISPUTE">DISPUTE</option>
+                                </select>
+                            </div>
+                            <div class="input-control">
+                                <label for="deals-per-page">На странице</label>
+                                <select id="deals-per-page">
+                                    <option value="25" selected={deals_pagination.per_page == 25}>25</option>
+                                    <option value="50" selected={deals_pagination.per_page == 50}>50</option>
+                                    <option value="100" selected={deals_pagination.per_page == 100}>100</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="deals-toolbar">
+                            <button id="deals-sort-status" type="button">Сортировка по статусу</button>
+                            <button id="deals-reset" type="button">Сбросить фильтры</button>
+                        </div>
+                        <div class="table-wrapper">
+                            <table id="deals-table">
+                                <thead>
+                                    <tr>
+                                        <th>numericId</th>
+                                        <th>ID</th>
+                                        <th>External Reference</th>
+                                        <th>Wallet</th>
+                                        <th>Банк</th>
+                                        <th>Сумма</th>
+                                        <th>Статус</th>
+                                        <th>Создана</th>
+                                        <th>Действия</th>
+                                    </tr>
+                                </thead>
+                                <tbody>{deals_view}</tbody>
+                            </table>
+                        </div>
+                        <div class="deals-pagination">
+                            <span id="deals-page-info">{deals_page_info.clone()}</span>
+                            <button id="deals-prev" type="button" disabled={deals_pagination.page <= 1}>"Назад"</button>
+                            <button
+                                id="deals-next"
+                                type="button"
+                                disabled={deals_pagination.total_pages == 0
+                                    || deals_pagination.page >= deals_pagination.total_pages}
+                            >"Вперед"</button>
+                        </div>
+                    </section>
                 </main>
                 <script inner_html=initial_data_script></script>
                 <script inner_html=dashboard_script></script>
@@ -924,4 +1532,8 @@ fn format_amount(value: Option<f64>) -> String {
         Some(v) => format!("{:.2}", v),
         None => "-".to_string(),
     }
+}
+
+fn format_timestamp(value: &NaiveDateTime) -> String {
+    value.format("%Y-%m-%d %H:%M:%S").to_string()
 }
