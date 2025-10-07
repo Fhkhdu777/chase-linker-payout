@@ -319,7 +319,7 @@ struct PayoutDetails {
     cancel_reason: Option<String>,
     cancel_reason_code: Option<String>,
     trader_id: Option<String>,
-    merchant_api_key: Option<String>,
+    merchant_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -657,12 +657,12 @@ async fn cancel_payout(
             p."cancelReason" AS "cancel_reason",
             p."cancelReasonCode" AS "cancel_reason_code",
             p."traderId" AS "trader_id",
-            m."apiKeyPublic" AS "merchant_api_key"
+            m."token" AS "merchant_token"
         FROM "Payout" p
         LEFT JOIN "Merchant" m
             ON m."id" = p."merchantId"
         WHERE p."id" = $1
-        FOR UPDATE
+        FOR UPDATE OF p
         "#,
     )
     .bind(&payout_id)
@@ -814,7 +814,7 @@ async fn dispatch_payout_callback(
     };
 
     let api_key = payout
-        .merchant_api_key
+        .merchant_token
         .as_ref()
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
@@ -824,7 +824,7 @@ async fn dispatch_payout_callback(
         Some(key) => key,
         None => {
             let result = CallbackDispatchResult::not_attempted(
-                "Merchant API key is not configured",
+                "Merchant token is not configured",
                 Some(webhook_url.clone()),
             );
             log_payout_callback(&state.pool, payout, &webhook_url, payload, &result).await?;
